@@ -3,3 +3,4 @@
 *.train
 *.greedy
 *.viterbi
+glove.6B.50d.txt
