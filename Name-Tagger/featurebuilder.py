@@ -1,4 +1,124 @@
 import argparse
+import numpy as np
+import time
+import sys
+import pickle 
+
+
+verbose = False
+embedding_key = {}
+embeddings = np.zeros((4000000,50))
+
+mean_embeddings = {}
+
+count_label = dict()
+count_token = dict()
+count_label_token= dict()
+npmi = dict()
+prototypes = {}
+
+def cosine_distance(v1,v2):
+    if np.dot(v1,v2) == 0:
+        return 0
+    return np.dot(v1,v2)/(np.linalg.norm(v1) * np.linalg.norm(v2))
+
+def print_summary(pro):
+    
+    with open('summary.log', 'w') as f:
+        f.write('---------- Labels ------------\n')
+        for k,v in count_label.items():
+            f.write('(l)Key: {}\t\t\t\tCount:{}\n'.format(k,v))
+        
+        f.write('---------- Words ------------\n')
+        for k,v in count_token.items():
+            f.write('(w)Key: {}\t\t\t\tCount:{}\n'.format(k,v))
+        
+        f.write('---------- Words and label ------------\n')
+        for k,v in count_label_token.items():
+            f.write('Key: {}\n'.format(k))
+            for w,c in v.items():
+                f.write('      (wl-{})Word: {}\t\t\t\tCount:{}\n'.format(k,w,c))
+        
+        f.write('---------- NPMI ------------\n')
+        for k,v in npmi.items():
+            f.write('Key: {}\n'.format(k))
+            for w,val in v.items():
+                f.write('      (npmi-{})Word: {}\t\t\tValue:{}\n'.format(k,w,val))
+        f.write('---------- Prototypes ------------\n')
+        for k,v in pro.items():
+            f.write(k + '\n')
+            f.write('-----------\n')
+            for words in v:
+                f.write(words + '\n')
+            f.write('----------------------\n')
+
+def initialize_probabilities(data, num_proto = 5):
+
+    for sentence in data:
+        for word_line in sentence:
+            count_label[word_line[3]] = count_label.setdefault(word_line[3],0) + 1
+            count_token[word_line[0]] = count_token.setdefault(word_line[0],0) + 1
+            count_label_token[word_line[3]][word_line[0]] = count_label_token.setdefault(word_line[3],dict()).setdefault(word_line[0],0) + 1
+
+    #print(len(count_label.values()))
+    #print(len(count_token.values()))
+    total_labels = sum(val for val in count_label.values())
+    total_words = sum(val for val in count_token.values())
+    #print('Total labels: {} Total words: {}'.format(total_labels,total_words))
+    assert(total_labels == total_words)
+    for k in count_label.keys():
+        npmi[k] = dict()
+        for w in count_token.keys():
+            npmi[k][w] = -1 + np.log((count_label[k]/total_labels) * (count_token[w]/total_words))/np.log(count_label_token[k].get(w,0)/total_labels)
+
+    num_proto = min(num_proto, len(count_token))
+    for k in count_label.keys():
+        word_index = []
+        for words in npmi[k].keys():
+            word_index.append(words)
+        
+        proto_idx = np.argpartition(list(npmi[k].values()), -num_proto)[-num_proto:]
+        proto_list = [word_index[idx] for idx in proto_idx]
+        prototypes[k] = proto_list
+
+    if verbose:
+        print('Printing summary')
+        print_summary(prototypes)
+    pickle_out = open("prototypes.pickle","wb")
+    pickle.dump(prototypes, pickle_out,protocol = 0)
+    pickle_out.close()
+
+
+
+def load_mean_embeddings():
+    for i,row in enumerate(embeddings.T):
+        print('Loading mean embeddings [%d/50]\r'%i,end="")
+        pos =[]
+        neg =[]
+        for val in row:
+            if val >= 0:
+                pos.append(val)
+            else:
+                neg.append(val)
+        pos = np.mean(pos)
+        neg = np.mean(neg)
+        mean_embeddings[i] = (pos,neg)
+
+def load_embeddings(filename):
+    global embeddings
+    with open(filename,'r') as f:
+        i = 0
+        for lines in f:
+            print('Loading embeddings [%d/4000000]\r'%i,end="")
+            lines = lines.split(' ')
+            embeddings[i] = np.array([float(i) for i in lines[1:]])
+            embedding_key[lines[0]] = i
+            # if embeddings is None:
+            #     embeddings = emb_vector
+            # else:
+            #     embeddings = np.concatenate((embeddings,emb_vector),axis = 1)
+            i+=1
+    print('Loaded words: {} embeddings: {} embedding length: {}'.format(len(embedding_key),len(embeddings),len(embeddings[0])))
 
 def hasNumbers(inputString):
     return any(char.isdigit() for char in inputString)
@@ -65,7 +185,9 @@ def _gen_features_better(index,
                       prev_token,
                       forward_token,
                       prefix_length = 4,
-                      suffix_length = 4):
+                      suffix_length = 4,
+                      embed_bin_thresh = 0.5,
+                      prototype_thresh = 0.5):
     '''
     List of features:
     token
@@ -106,26 +228,28 @@ def _gen_features_better(index,
     if len(prev_tag) == 2:
         result['prev_tag_1'] = prev_tag[0]
         result['prev_tag_2'] = prev_tag[1]
-        result['prev_seq_all'] = prev_tag[1] + ',' + prev_tag[0]
+        result['prev_seq_1'] = prev_tag[1] + ',' + prev_tag[0]
+        result['prev_seq_2'] = prev_tag[0] + ',' + tag
     elif len(prev_tag) == 1:
         result['prev_tag_1'] = prev_tag[0]
+        #result['prev_seq_1'] = prev_tag[0] + ',' + tag
     # POS tags
     # Prev
     if len(prev_POS_tag) == 2:
         result['prev_pos_tag_1'] = prev_POS_tag[0]
         result['prev_pos_tag_2'] = prev_POS_tag[1]
-        result['prev_pos_seq_half'] = POS + ',' + prev_POS_tag[0]
-        result['prev_pos_seq_all'] = POS + ',' + prev_POS_tag[1] + ',' + prev_POS_tag[0]
+        result['prev_pos_seq_1'] = prev_POS_tag[1] + ',' + prev_POS_tag[0]
+        result['prev_pos_seq_2'] = prev_POS_tag[0] + ',' + POS
     elif len(prev_POS_tag) == 1:
         result['prev_pos_tag_1'] = prev_POS_tag[0]
-        result['prev_pos_seq_all'] = POS + ',' + prev_POS_tag[0]
+        result['prev_pos_seq_all'] = prev_POS_tag[0] + ',' + POS
     
     # Forward
     if len(forward_POS_tag) == 2:
         result['fw_pos_tag_1'] = forward_POS_tag[0]
         result['fw_pos_tag_2'] = forward_POS_tag[1]
-        result['fw_pos_seq_half'] = POS + ',' + forward_POS_tag[0]
-        result['fw_pos_seq_all'] = POS + ',' + forward_POS_tag[0] + ',' + forward_POS_tag[1]
+        result['fw_pos_seq_1'] = POS + ',' + forward_POS_tag[0]
+        result['fw_pos_seq_2'] = forward_POS_tag[0] + ',' + forward_POS_tag[1]
     elif len(forward_POS_tag) == 1:
         result['fw_pos_tag_1'] = forward_POS_tag[0]
         result['fw_pos_seq_all'] = POS + ',' + forward_POS_tag[0]
@@ -138,8 +262,9 @@ def _gen_features_better(index,
     if len(prev_token) == 2:
         result['prev_token_1'] = prev_token[0]
         result['prev_token_2'] = prev_token[1]
-        result['prev_token_half'] = prev_token[0] + ',' + token
-        result['prev_token_all'] = prev_token[1] + ',' + prev_token[0] + ',' + token
+        result['prev_token_seq_1'] = prev_token[1] + ',' + prev_token[0]
+        result['prev_token_seq_2'] = prev_token[0] + ',' + token
+        #result['prev_token_all'] = prev_token[1] + ',' + prev_token[0] + ',' + token
     elif len(prev_token) == 1:
         result['prev_token_1'] = prev_token[0]
         result['prev_token_all'] = prev_token[0] + ',' + token
@@ -147,8 +272,8 @@ def _gen_features_better(index,
     if len(forward_token) == 2:
         result['fw_token_1'] = forward_token[0]
         result['fw_token_2'] = forward_token[1]
-        result['fw_token_half'] = token + ',' + forward_token[0]
-        result['fw_token_all'] = token + ',' + forward_token[0] + ',' + forward_token[1]
+        result['fw_token_seq_1'] = token + ',' + forward_token[0]
+        result['fw_token_seq_2'] = forward_token[0] + ',' + forward_token[1]
     elif len(forward_token) == 1:
         result['fw_token_1'] = forward_token[0]
         result['fw_token_all'] = token + ',' + forward_token[0]
@@ -207,6 +332,128 @@ def _gen_features_better(index,
     # five_grams = get_ngrams(token, 5)
     # for gram in five_grams:
     #     result[gram] = gram
+    
+    # Word embeddings
+    idx = embedding_key.get(token.lower(),-1)
+    # Plain binarization
+    if idx != -1:
+        word_embed = embeddings[idx]
+        for i,val in enumerate(word_embed):
+            # if val > mean_embeddings[i][0]:
+            #     result['embed_'+str(i)] = 'P'
+            # if val < mean_embeddings[i][1]:
+            #     result['embed_'+str(i)] = 'N'
+            if val > embed_bin_thresh:
+                result['embed_'+str(i)] = 'P'
+            if val < -embed_bin_thresh:
+                result['embed_'+str(i)] = 'N'
+
+    #Previous and forward embeddings
+    # if len(prev_token) == 2:
+    #     #previous word
+    #     idx = embedding_key.get(prev_token[0].lower(),-1)
+    #     if idx != -1:
+    #         word_embed = embeddings[idx]
+    #         for i,val in enumerate(word_embed):
+    #             # if val > mean_embeddings[i][0]:
+    #             #     result['embed_'+str(i)] = 'P'
+    #             # if val < mean_embeddings[i][1]:
+    #             #     result['embed_'+str(i)] = 'N'
+    #             if val > embed_bin_thresh:
+    #                 result['prev_embed_1_'+str(i)] = 'P'
+    #             if val < -embed_bin_thresh:
+    #                 result['prev_embed_1_'+str(i)] = 'N'
+    #     #pre-previous word
+    #     idx = embedding_key.get(prev_token[1].lower(),-1)
+    #     if idx != -1:
+    #         word_embed = embeddings[idx]
+    #         for i,val in enumerate(word_embed):
+    #             # if val > mean_embeddings[i][0]:
+    #             #     result['embed_'+str(i)] = 'P'
+    #             # if val < mean_embeddings[i][1]:
+    #             #     result['embed_'+str(i)] = 'N'
+    #             if val > embed_bin_thresh:
+    #                 result['prev_embed_2_'+str(i)] = 'P'
+    #             if val < -embed_bin_thresh:
+    #                 result['prev_embed_2_'+str(i)] = 'N'
+    # elif len(prev_token) == 1:
+    #     idx = embedding_key.get(prev_token[0].lower(),-1)
+    #     if idx != -1:
+    #         word_embed = embeddings[idx]
+    #         for i,val in enumerate(word_embed):
+    #             # if val > mean_embeddings[i][0]:
+    #             #     result['embed_'+str(i)] = 'P'
+    #             # if val < mean_embeddings[i][1]:
+    #             #     result['embed_'+str(i)] = 'N'
+    #             if val > embed_bin_thresh:
+    #                 result['prev_embed_1_'+str(i)] = 'P'
+    #             if val < -embed_bin_thresh:
+    #                 result['prev_embed_1_'+str(i)] = 'N'
+        
+    
+    # if len(forward_token) == 2:
+    #     #previous word
+    #     idx = embedding_key.get(forward_token[0].lower(),-1)
+    #     if idx != -1:
+    #         word_embed = embeddings[idx]
+    #         for i,val in enumerate(word_embed):
+    #             # if val > mean_embeddings[i][0]:
+    #             #     result['embed_'+str(i)] = 'P'
+    #             # if val < mean_embeddings[i][1]:
+    #             #     result['embed_'+str(i)] = 'N'
+    #             if val > embed_bin_thresh:
+    #                 result['fw_embed_1_'+str(i)] = 'P'
+    #             if val < -embed_bin_thresh:
+    #                 result['fw_embed_1_'+str(i)] = 'N'
+    #     #pre-previous word
+    #     idx = embedding_key.get(forward_token[1].lower(),-1)
+    #     if idx != -1:
+    #         word_embed = embeddings[idx]
+    #         for i,val in enumerate(word_embed):
+    #             # if val > mean_embeddings[i][0]:
+    #             #     result['embed_'+str(i)] = 'P'
+    #             # if val < mean_embeddings[i][1]:
+    #             #     result['embed_'+str(i)] = 'N'
+    #             if val > embed_bin_thresh:
+    #                 result['fw_embed_2_'+str(i)] = 'P'
+    #             if val < -embed_bin_thresh:
+    #                 result['fw_embed_2_'+str(i)] = 'N'
+        
+    # elif len(forward_token) == 1:
+    #     idx = embedding_key.get(forward_token[0].lower(),-1)
+    #     if idx != -1:
+    #         word_embed = embeddings[idx]
+    #         for i,val in enumerate(word_embed):
+    #             # if val > mean_embeddings[i][0]:
+    #             #     result['embed_'+str(i)] = 'P'
+    #             # if val < mean_embeddings[i][1]:
+    #             #     result['embed_'+str(i)] = 'N'
+    #             if val > embed_thresh:
+    #                 result['fw_embed_1_'+str(i)] = 'P'
+    #             if val < -embed_thresh:
+    #                 result['fw_embed_1_'+str(i)] = 'N'
+    
+    # Prototype features:
+    idx = embedding_key.get(token.lower(),-1)
+    # Plain binarization
+    word_embed = [0] * 50
+    if idx != -1:
+        word_embed = embeddings[idx]
+   
+    #print('Word: {} \t Word embedding: {}'.format(token,word_embed))
+    for _,v in prototypes.items():
+        for proto in v:
+            id_proto = embedding_key.get(proto.lower(),-1)
+            proto_embed = [0] * 50
+            if id_proto != -1:
+                proto_embed = embeddings[id_proto]
+            
+            #print('Prototype: {} \t Prototype embedding: {}'.format(proto,proto_embed))
+            if cosine_distance(proto_embed,word_embed) >= prototype_thresh:
+                #print('Cosine similiarity: {}'.format(cosine_distance(proto_embed,word_embed)))
+                result['proto_' + proto] = 'proto_' + proto
+    
+        
     
     return result
     
@@ -315,7 +562,8 @@ def generate_features(data,
                                               prev_token, 
                                               forward_token, 
                                               prefix_length = 6,
-                                              suffix_length = 6)
+                                              suffix_length = 6,
+                                              embed_bin_thresh = 0.6)
 
             sentence_features.append(result)
             
@@ -352,7 +600,7 @@ def generate_features(data,
 
         
         features.append(sentence_features)
-    
+
     #print(features[1])
     return features
             
@@ -392,16 +640,38 @@ parser.add_argument('--train', default = False, action = 'store_true', help = 'T
 parser.add_argument('--out', default = 'features.train', help = 'Name of the output file')
 parser.add_argument('--pos', default = False, action = 'store_true')
 parser.add_argument('--chunk', default = False, action = 'store_true')
+parser.add_argument('--num_proto', default = 2, action = 'store_true')
+
 args = parser.parse_args()
 
 #train_file = './CONLL_NAME_CORPUS_FOR_STUDENTS/CONLL_train.pos-chunk-name'
+print('Loading word embeddings ..')
+start = time.monotonic()
+load_embeddings('glove.6B.50d.txt')
+print('Embeddings loaded in {}s'.format(time.monotonic()-start))
+# start = time.monotonic()
+# load_mean_embeddings()
+# print('Embeddings loaded in {}s'.format(time.monotonic()-start))
 
 data = get_data(args.file)
+if args.train:
+    print('Calculating.. prototype features')
+    initialize_probabilities(data, num_proto = args.num_proto)
+
+pickle_in = open("prototypes.pickle","rb")
+prototypes = pickle.load(pickle_in)
+# for k,v in prototypes.items():
+#     print(k)
+#     print('-----------')
+#     for words in v:
+#         print(words)
+#     print('----------------------')
+
 features = generate_features(data, 
                             method = 'better', 
                             prev_tag_window = 1, 
-                            prev_POS_window = 1, 
-                            forward_POS_window = 1, 
+                            prev_POS_window = 2, 
+                            forward_POS_window = 2, 
                             prev_token_window = 2,
                             forward_token_window = 2,
                             train = args.train, 
