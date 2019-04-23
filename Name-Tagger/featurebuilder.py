@@ -495,7 +495,7 @@ def generate_features(data,
                 prev_tag = ['#'] * prev_tag_window
             else:
                 prev_tag.append('@@')
-                if prev_POS_window == 2:
+                if prev_tag_window == 2:
                     prev_tag.append('$$')
 
         if prev_POS_window > 0:
